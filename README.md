@@ -3,9 +3,12 @@ Code repository for the paper "A phase-field model for the brittle fracture of E
 Submitted to CMAME
 
 # Dependencies
-Legacy FEniCS with PETSc.
+* legacy FEniCS with PETSc.
+* meshio
+* pygmsh
+* gmsh
 
 # Contents
 Two scripts are provided:
 * Euler-Bernoulli (1D) beam fracture
-* 2D beam fracture (linear elasticity)
+* 2D beam fracture (frac_clamp_2D)
