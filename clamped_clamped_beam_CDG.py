@@ -462,15 +462,6 @@ def alternate_minimization(
     return converged_u, alpha_max
 
 
-"""
-Now setup loading and postprocessing.
-Compression and traction are kept linearly related, following a line along the
-space of loads. Multiple lines can be followed spanning the half space. If
-allowed, the solution will be distributed on more processes and gathered at
-the end in a single array, or Pandas DataFrame
-"""
-
-
 def postprocessing():
     Epsilonf = project(eps[0], V_def)
     Chif = project(chi[0], V_def)
