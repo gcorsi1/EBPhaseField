@@ -4,7 +4,7 @@ Submitted to CMAME
 
 ## Dependencies
 * legacy FEniCS (with PETSc): latest version **2019.2.0.dev0** from the repository was used 
-* meshio, pygmsh, gmsh python packages
+* meshio, pygmsh, gmsh, pandas python packages
 
 ## Contents
 Two scripts are provided:
