@@ -1,17 +1,18 @@
 """
-Solve the damage problem for a 1D beam, initially clamped at 
-both sides, with two damage descriptors
+Solve the damage problem for a 1D beam, with two damage descriptors
 used along thickness in a thin beam.
 """
 
 from argparse import ArgumentParser
 
 import numpy as np
+import pandas as pd
 import sympy
+import ufl_legacy as ufl
 from dolfin import *
 
 
-# Lumped-mass projection to CG1, which remains monotone.
+# Option2: Lumped-mass projection to CG1, which remains monotone.
 def lumpedProject(f, V):
     v = TestFunction(V)
     lhs = assemble(inner(Constant(1.0), v) * dx)
@@ -33,32 +34,32 @@ parameters["std_out_all_processes"] = False
 mpi_comm = MPI.comm_world
 mpiRank = MPI.rank(mpi_comm)
 
+
 NLAYERS = 2
 
 # Geometric and constitutive parameters. Units: kN, mm
-Gcf = 1.0e-4
+Gcf = 0.000666666666667
 # Stiffness modulation and dissipated energy function
-residual_stiffness = 10 * Gcf
+residual_stiffness = 0.2 * Gcf
 residual_stiffness = Constant(residual_stiffness)
 # Damage parameters
 Gc, ell = Constant(Gcf), 0.01
 
 # Geometry and Material
 Lx, b, h = 1.0, 1.0, 0.1
-mesh_size_ref = 0.1 * ell
+mesh_size_ref = 0.5 * ell
 
 # Elastic properties
 nu = Constant(0.3)
 nuf = float(nu)
-Yf = 20.8
+Yf = 1
 Y = Constant(Yf)
 
-mu0 = Y / 2.0 / (1.0 + nu)
-lb0 = 2.0 * mu0 * nu / (1.0 - 2.0 * nu)
-
 # Critical Epsilon. Notice the (1-nu^2) term, needed if plane strain
-epsc = np.sqrt(3.0 / 8.0 * Gcf / ell * (1 - nuf**2) / Yf)
-epscu = ufl.sqrt(3.0 / 8.0 * Gcf / ell * (1 - nuf**2) / Y)
+epsc = np.sqrt(3.0 / 2.0 * Gcf / ell / Yf / h)
+sigmacf = Yf * epsc
+print("=" * 80 + "\n" + f"eps_c = {epsc}, sigma_c = {sigmacf}\n" + "=" * 80 + "\n")
+epscu = ufl.sqrt(3.0 / 2.0 * Gcf / ell / Y / h)
 sigmac = Y * epscu
 
 mesh = UnitIntervalMesh(int(1.0 / mesh_size_ref))
@@ -84,7 +85,6 @@ ds = Measure("ds", domain=mesh, subdomain_data=facet_function)
 
 # Discrete space
 P1 = FiniteElement("P", interval, degree=1)
-P2 = FiniteElement("P", interval, degree=2)
 V_def = FunctionSpace(mesh, "CG", 1)
 V_alpha = FunctionSpace(mesh, "CG", 1)
 V_sigma = FunctionSpace(mesh, "DG", 0)
@@ -120,13 +120,7 @@ v1be = Expression("e", e=0.0, degree=2)
 v1bc = Expression("c", c=0.0, degree=2)
 precompr = Expression("c", c=0.0, degree=2)
 
-bc_lv = DirichletBC(Q.sub(0), v0be, left)
-bc_rv = DirichletBC(Q.sub(0), v1be, right)
-bc_lw = DirichletBC(Q.sub(1), Constant(0.0), left)
-bc_rw = DirichletBC(Q.sub(1), Constant(0.0), right)
-
-# empty BCs for displacement, will enforce Dirichlet with
-# penalization terms
+# Will enforce Dirichlet weakly
 bc_u = []
 bc_alpha = [
     DirichletBC(V_alpha, Constant(0.0), right),
@@ -148,6 +142,7 @@ w = lambda alpha: alpha
 a0 = lambda alpha: (1.0 - alpha) ** 2
 z = sympy.Symbol("z")
 c_w = 4 * sympy.integrate(sympy.sqrt(w(z)), (z, 0, 1))
+print(f"\nc_w value is {c_w}\n")
 ####################################################################################
 aph0, aph1 = aphs
 # Stiffnesses
@@ -163,9 +158,14 @@ A, B, C = (
         * h**3
         * Y
     ),
-    1.0 / 8.0 * ((aph0 - aph1) * (-2 + aph0 + aph1) * h**2 * Y),
+    -1.0 / 8.0 * ((aph0 - aph1) * (-2 + aph0 + aph1) * h**2 * Y),
 )
-B0 = 1.0 / 12.0 * h**3 * Y
+
+CLAMP_COEFF = 500.0
+A0, B0 = Function(V_alpha), Function(V_alpha)
+A0.vector()[:] = CLAMP_COEFF * h * Yf
+B0.vector()[:] = CLAMP_COEFF * 1 / 12.0 * h**3 * Yf
+
 
 eps, wprime = grad(v_), grad(w_)[0]
 chi = grad(wprime)
@@ -183,8 +183,8 @@ hint = h / NLAYERS
 n = FacetNormal(mesh)
 TAU = B0 * Constant(1.0 / mesh_size_ref)
 TAU = B * Constant(1.0 / mesh_size_ref)
-TAUG = B * Constant(1.0 / mesh_size_ref) * 2
-GAMMAG = A * Constant(1.0 / mesh_size_ref)
+TAUG = B0  # * Constant(1.0 / mesh_size_ref) * 2
+GAMMAG = A0  # * Constant(1.0 / mesh_size_ref)
 TAUH = 2 * B * Constant(1.0 / mesh_size_ref)
 
 L_ext = precompr * v_ * dx
@@ -219,6 +219,8 @@ chiproj = Function(V_def)
 mproj.rename("mproj", "mproj")
 nproj.rename("nproj", "nproj")
 chiproj.rename("chiproj", "chiproj")
+A0.rename("A0", "A0")
+B0.rename("B0", "B0")
 
 # Elastic energy
 elastic_energy = (
@@ -243,28 +245,27 @@ sigma_top_expr = (
     (
         4
         * (
-            6 * (B * chiproj + C * eps[0])
+            -6 * (B * chiproj + C * eps[0])
             + (1 + aph0 - 2 * aph1) * h * (A * eps[0] + C * chiproj)
         )
     )
-    / ((-2 + aph0 + aph1 + 1e-2) ** 2 * h**2)
+    / ((-2 + aph0 + aph1 + 1e-3) ** 2 * h**2)
     / sigmac
 )
 sigma_bot_expr = (
     (
         4
         * (
-            -6 * (B * chiproj + C * eps[0])
+            6 * (B * chiproj + C * eps[0])
             + (1 - 2 * aph0 + aph1) * h * (A * eps[0] + C * chiproj)
         )
     )
-    / ((-2 + aph0 + aph1 + 1e-2) ** 2 * h**2)
+    / ((-2 + aph0 + aph1 + 1e-3) ** 2 * h**2)
     / sigmac
 )
 
 fsigmaa = -1000 * ufl.tanh(8 * (sigma_top_expr + 0.5)) + 1001
 fsigmab = -1000 * ufl.tanh(8 * (sigma_bot_expr + 0.5)) + 1001
-# fsigma = ufl.conditional(sigma_top_expr>0, Constant(1.0), 1.0+ufl.exp(-1*(sigma_top_expr)**2/2.0))
 fsigmaaf = project(fsigmaa, V_alpha)
 fsigmabf = project(fsigmab, V_alpha)
 fsigmaaf.rename("fsigmaa", "fsigmaa")
@@ -278,8 +279,8 @@ diss_ = []
 for i, aphi in enumerate(aphs):
     diss_.append(
         Gc
-        * hint
-        / 2
+        * 1.0  # * h
+        / 1.0  # / 2.0
         / float(c_w)
         * (ws[i] / ell * aphi + ell * dot(grad(aphi), grad(aphi)))
         * dx
@@ -326,9 +327,11 @@ solver_u = NewtonSolver()
 
 # Solver for the u-problem
 prm = solver_u.parameters
+# prm["newton_solver"]["linear_solver"] = "lu"
 prm["maximum_iterations"] = 200
 prm["absolute_tolerance"] = 1e-8
 prm["relative_tolerance"] = 1e-8
+# prm["newton_solver"]["convergence_criterion"] = "residual"
 prm["error_on_nonconvergence"] = False
 prm["report"] = True
 
@@ -370,9 +373,11 @@ solver_alpha_tao = PETScTAOSolver()
 solver_alpha_tao.parameters.update(
     {
         "method": "tron",
-        "linear_solver": "umfpack",
+        "linear_solver": "default",
         "maximum_iterations": 10000,
         "line_search": "gpcg",
+        #     "linear_solver" : "nash",
+        # "linear_solver" : "stcg",
         "preconditioner": "hypre_amg",
         "gradient_absolute_tol": 1.0e-05,
         "gradient_relative_tol": 1.0e-05,
@@ -411,12 +416,6 @@ def alternate_minimization(
         Epsilonf = project(eps[0], V_def)
         Chif = project(chi[0], V_def)
         proj_solver.solve(chiproj.vector(), assemble(chirec))
-
-        sigma_top = project(sigma_top_expr, V_sigma)
-        sigma_bot = project(sigma_bot_expr, V_sigma)
-        sigma_top.rename("sigma_top", "sigma_top")
-        sigma_bot.rename("sigma_bot", "sigma_bot")
-
         fsigmaaf.vector()[:] = lumpedProject(fsigmaa, V_alpha).vector()
         fsigmabf.vector()[:] = lumpedProject(fsigmab, V_alpha).vector()
 
@@ -459,6 +458,8 @@ def alternate_minimization(
 
         iter_step = iter_step + 1
 
+        A0.vector()[:] = lumpedProject(Constant(CLAMP_COEFF) * A, V_alpha).vector()
+        B0.vector()[:] = lumpedProject(Constant(CLAMP_COEFF) * B, V_alpha).vector()
     return converged_u, alpha_max
 
 
@@ -478,19 +479,12 @@ def postprocessing():
     Chif.rename("chi", "chi")
     Normalf.rename("Normal", "Normal")
     Momentf.rename("Moment", "Moment")
+
     return Epsilonf, Chif, Wprime, Normalf, Momentf
 
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument(
-        "-a",
-        "--angle",
-        dest="angle",
-        help="ratio of bending to traction",
-        type=float,
-        default=-0.3,
-    )
     parser.add_argument(
         "-d", "--delta", dest="delta", help="step delta", type=float, default=5.0e-4
     )
@@ -507,15 +501,12 @@ if __name__ == "__main__":
     if MPI.rank(MPI.comm_world) == 0:
         print(f"Running with {args=}\n")
 
-    # Load (imposed displacement)
-    # rotation and compression/traction displacement have a fixed ratio, positive
-    # for traction, negative for compression
-    angle_compression_ratio = args.angle
     delta_l = args.delta
     delta_l_reduce_fact = 1.0 / 2.0
     COMPRESSION = args.comp
 
-    filename_alpha_u = output_dir + f"alphau_tan{100*angle_compression_ratio:.0f}.xdmf"
+    filename_alpha_u = output_dir + f"alphau_compr{100*COMPRESSION:.0f}.xdmf"
+    filename_iters = f"energies_compr{100*COMPRESSION:.0f}.txt"
 
     # Solution
     with XDMFFile(MPI.comm_world, filename_alpha_u) as file_alpha_u:
@@ -532,6 +523,7 @@ if __name__ == "__main__":
         outer_step = 0
 
         csv_data = []
+        compression, vertload = 0.0, 0.0
 
         while True:
             if MPI.rank(MPI.comm_world) == 0:
@@ -543,6 +535,11 @@ if __name__ == "__main__":
 
             precompr.c = COMPRESSION
             problem_u.P = t
+
+            # SAVE COMPRESSION AND VERTICAL LOAD FOR THIS STEP BEFORE UPDATING
+            # THEM AFTER THE NUMERICAL SOLUTION
+            compression = COMPRESSION
+            vertload = t
 
             outer_step += 1  # for image visualization name
             # Solve alternate minimization
@@ -577,6 +574,7 @@ if __name__ == "__main__":
             for i, aphi in enumerate(aphs):
                 lbs[i].vector()[:] = aphi.vector()
             if alpha_max > 0.0:
+                # cracklen_last = 1.0 / Gcf * assemble(dissipated_energy)
                 cracklen_last = (
                     aphs[0].vector().get_local().max() * h / 2.0
                 )  # only alpha breaks
@@ -589,8 +587,8 @@ if __name__ == "__main__":
 
             Epsilonf, Chif, Wprime, Normalf, Momentf = postprocessing()
             print(
-                f"Epsilon over epsc {Epsilonf(0.1)/epsc}, "
-                f"Chi*h/2 over epsc {Chif(0.1)*h/2.0/epsc}."
+                f"Epsilon over epsc {Epsilonf(0.0)/epsc}, "
+                f"Chi*h/2 over epsc {Chif(0.0)*h/2.0/epsc}."
             )
 
             sigma_top = project(sigma_top_expr, V_sigma)
@@ -617,6 +615,8 @@ if __name__ == "__main__":
                 file_alpha_u.write(fsigmaaf, i_t)
                 file_alpha_u.write(fsigmabf, i_t)
                 file_alpha_u.write(mproj, i_t)
+                file_alpha_u.write(A0, i_t)
+                file_alpha_u.write(B0, i_t)
                 file_alpha_u.write(nproj, i_t)
                 file_alpha_u.write(chiproj, i_t)
 
@@ -624,6 +624,8 @@ if __name__ == "__main__":
             vy = project(q_.sub(1), V_alpha)
             csvv = {
                 "step": i_t * np.ones_like(vx.vector().get_local()),
+                "axial_load": compression,
+                "vertical_load": vertload,
                 "x": V_alpha.tabulate_dof_coordinates().flatten(),
                 "vx": vx.vector().get_local(),
                 "vy": vy.vector().get_local(),
@@ -637,12 +639,13 @@ if __name__ == "__main__":
 
             csv_data.append(csvv)
             # Break after first nucleation of crack, or follow its evolution?
-            if alpha_max == 2.0:
+            # if alpha_max == 2.0:
+            #     break
+            if i_t == 5:
                 break
 
-        print(f"FINAL: {t=}, {i_t=}, {angle_compression_ratio=}.\n")
 
-    csv_output_dir = output_dir + "csv/"
+    csv_output_dir = output_dir  # + "csv/"
     for i, csvi in enumerate(csv_data):
         df = pd.DataFrame(csvi)
         df.to_csv(csv_output_dir + f"csv_step_{i}")
